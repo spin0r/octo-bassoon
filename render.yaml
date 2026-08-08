@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: itza-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ITZA_BOT_TOKEN
+        sync: false
+      - key: ITZA_EMAIL
+        sync: false
+      - key: ITZA_PASSWORD
+        sync: false
+      - key: ITZA_STYLE
+        value: modern
+      - key: ITZA_WORKERS
+        value: "1"
+      - key: RENDER_EXTERNAL_URL
+        sync: false
