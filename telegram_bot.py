@@ -19,10 +19,11 @@ import html
 import json
 import logging
 import os
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
@@ -34,6 +35,8 @@ from itza import ITZAQuizClient, THEMES
 
 LOG = logging.getLogger("itza.telegram")
 
+
+# ── Health Check Server ──────────────────────────────────────────────
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Simple HTTP handler for Render.com health checks and ping endpoints."""
@@ -92,6 +95,7 @@ def start_keep_alive():
     thread.start()
 
 
+# ── Styles ───────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class TelegramStyle:
@@ -108,6 +112,8 @@ BOT_STYLES = {
     "plain": TelegramStyle("plain", "•", ""),
 }
 
+
+# ── Account Storage ──────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class AccountSpec:
@@ -153,6 +159,41 @@ def esc(value) -> str:
     return html.escape(str(value or ""), quote=False)
 
 
+# ── Run State Tracking ───────────────────────────────────────────────
+
+@dataclass
+class RunState:
+    """Tracks the live state of a running queue for real-time status queries."""
+    status: str = "idle"            # idle | running | finished | failed
+    current_quiz: str = ""          # Name of quiz currently being processed
+    completed: int = 0
+    failed: int = 0
+    total: int = 0
+    started_at: float = 0.0
+    yakka_start: int | None = None
+    yakka_current: int | None = None
+    yakka_earned: int = 0
+    errors: list = field(default_factory=list)
+    account_key: str = ""
+
+
+@dataclass
+class LastRun:
+    """Stores the result of the most recent completed run."""
+    timestamp: float = 0.0
+    account_key: str = ""
+    completed: int = 0
+    failed: int = 0
+    total: int = 0
+    yakka_start: int | None = None
+    yakka_end: int | None = None
+    yakka_earned: int = 0
+    elapsed: float = 0.0
+    scope: str = ""
+
+
+# ── Telegram API ─────────────────────────────────────────────────────
+
 class TelegramAPI:
     """Small, thread-safe Bot API client with retry/backoff."""
     def __init__(self, token: str, timeout: int = 35):
@@ -182,6 +223,29 @@ class TelegramAPI:
         return data.get("result")
 
 
+# ── Progress Bar Helper ──────────────────────────────────────────────
+
+def progress_bar(done: int, total: int, width: int = 20) -> str:
+    """Render a text progress bar like [████████░░░░░░░░░░░░] 40%"""
+    if total <= 0:
+        return "[" + "░" * width + "] 0%"
+    ratio = min(done / total, 1.0)
+    filled = int(width * ratio)
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(ratio * 100)
+    return f"[{bar}] {pct}%"
+
+
+def fmt_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as Xm Ys or Xs."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s}s"
+
+
+# ── Main Bot ─────────────────────────────────────────────────────────
+
 class TelegramBot:
     def __init__(self, token: str, *, style="modern", email="", password="",
                  workers=1, admin_ids=(), accounts=None):
@@ -199,6 +263,12 @@ class TelegramBot:
         self.job_lock = threading.Lock()
         self.job = None
         self.pending_states = {}
+
+        # Live run tracking
+        self.run_state = RunState()
+        self.last_run = None  # LastRun or None
+        self._active_client = None  # ITZAQuizClient used by current/last run
+        self._active_client_lock = threading.Lock()
 
     @property
     def theme(self):
@@ -229,12 +299,16 @@ class TelegramBot:
             return True
         return False
 
+    # ── Keyboards ────────────────────────────────────────────────────
+
     def markup(self):
         return {"inline_keyboard": [
             [{"text": "▶ Run queue", "callback_data": "run"},
              {"text": "▶ Run all", "callback_data": "runall"}],
             [{"text": "📊 Status", "callback_data": "status"},
-             {"text": "👤 Accounts", "callback_data": "accounts"}],
+             {"text": "💰 Balance", "callback_data": "balance"}],
+            [{"text": "👤 Accounts", "callback_data": "accounts"},
+             {"text": "🔍 Check", "callback_data": "check"}],
             [{"text": "➕ Add Account", "callback_data": "add_account"},
              {"text": "🎨 Style", "callback_data": "styles"}],
             [{"text": "❔ Help", "callback_data": "help"}],
@@ -255,23 +329,86 @@ class TelegramBot:
         rows.append([{"text": "‹ Back", "callback_data": "home"}])
         return {"inline_keyboard": rows}
 
+    # ── Dashboard ────────────────────────────────────────────────────
+
     def dashboard(self):
         t = self.theme
+        rs = self.run_state
+
+        # Job status
         with self.job_lock:
             job = self.job
         if job and job.is_alive():
-            state = "<b>running</b>"
-        elif job:
-            state = "<b>finished</b>"
+            state = "🟢 <b>RUNNING</b>"
+        elif rs.status == "finished":
+            state = "✅ <b>finished</b>"
+        elif rs.status == "failed":
+            state = "❌ <b>failed</b>"
         else:
-            state = "<b>idle</b>"
-        return (f"{t.icon} <b>ITZA Queue Runner</b>\n\n"
-                f"Status: {state}\n"
-                f"Account: <code>{esc(self.selected_account or 'none')}</code> "
-                f"({len(self.accounts):,} configured)\n"
-                f"Style: <code>{esc(self.style)}</code>\n"
-                f"Workers: <code>{self.workers}</code>\n"
-                f"Uptime: <code>{int(time.time() - self.started)}s</code>")
+            state = "⚪ <b>idle</b>"
+
+        lines = [
+            f"{t.icon} <b>ITZA Queue Runner</b>",
+            "",
+            f"Status: {state}",
+            f"Account: <code>{esc(self.selected_account or 'none')}</code> "
+            f"({len(self.accounts):,} configured)",
+            f"Style: <code>{esc(self.style)}</code> · Workers: <code>{self.workers}</code>",
+            f"Uptime: <code>{fmt_elapsed(time.time() - self.started)}</code>",
+        ]
+
+        # Show live balance if we have a client
+        balance = self._get_cached_balance()
+        if balance is not None:
+            lines.append(f"💰 Balance: <code>{balance:,}</code> Yakka")
+
+        # Show live run progress if running
+        if job and job.is_alive() and rs.status == "running":
+            lines.append("")
+            lines.append(f"<b>⏳ Running: {rs.account_key}</b>")
+            lines.append(f"<code>{progress_bar(rs.completed + rs.failed, rs.total)}</code>")
+            lines.append(f"Progress: <code>{rs.completed + rs.failed}/{rs.total}</code> "
+                         f"(✅ {rs.completed} · ❌ {rs.failed})")
+            if rs.current_quiz:
+                lines.append(f"Current: <code>{esc(rs.current_quiz[:50])}</code>")
+            if rs.yakka_earned:
+                lines.append(f"Points earned: <code>+{rs.yakka_earned:,}</code> Yakka")
+            elapsed = time.time() - rs.started_at if rs.started_at else 0
+            if elapsed > 0:
+                lines.append(f"Elapsed: <code>{fmt_elapsed(elapsed)}</code>")
+
+        # Show last run info
+        if self.last_run and not (job and job.is_alive()):
+            lr = self.last_run
+            lines.append("")
+            lines.append("<b>📋 Last Run</b>")
+            ago = time.time() - lr.timestamp
+            lines.append(f"When: <code>{fmt_elapsed(ago)} ago</code> · Scope: <code>{esc(lr.scope)}</code>")
+            lines.append(f"Quizzes: <code>{lr.total}</code> (✅ {lr.completed} · ❌ {lr.failed})")
+            if lr.yakka_start is not None and lr.yakka_end is not None:
+                delta = lr.yakka_end - lr.yakka_start
+                sign = "+" if delta >= 0 else ""
+                lines.append(f"Balance: <code>{lr.yakka_start:,}</code> → <code>{lr.yakka_end:,}</code> "
+                             f"(<code>{sign}{delta:,}</code>)")
+            if lr.elapsed > 0:
+                rate = (lr.completed + lr.failed) / lr.elapsed
+                lines.append(f"Time: <code>{fmt_elapsed(lr.elapsed)}</code> · "
+                             f"Rate: <code>{rate:.1f}</code> q/s")
+
+        return "\n".join(lines)
+
+    def _get_cached_balance(self) -> int | None:
+        """Try to get balance from active client without blocking."""
+        with self._active_client_lock:
+            client = self._active_client
+        if client and client.access_token:
+            try:
+                return client.get_yakka()
+            except Exception:
+                pass
+        return None
+
+    # ── Send/Edit Helpers ────────────────────────────────────────────
 
     def send(self, chat_id, text, *, markup=None):
         return self.api.call("sendMessage", chat_id=chat_id, text=text,
@@ -280,11 +417,15 @@ class TelegramBot:
                              reply_markup=markup)
 
     def edit(self, chat_id, message_id, text, *, markup=None):
-        return self.api.call("editMessageText", chat_id=chat_id,
-                             message_id=message_id, text=text,
-                             parse_mode=self.theme.parse_mode,
-                             link_preview_options={"is_disabled": True},
-                             reply_markup=markup)
+        try:
+            return self.api.call("editMessageText", chat_id=chat_id,
+                                 message_id=message_id, text=text,
+                                 parse_mode=self.theme.parse_mode,
+                                 link_preview_options={"is_disabled": True},
+                                 reply_markup=markup)
+        except Exception:
+            # Message might not have changed or was deleted
+            return None
 
     def allowed(self, update):
         if not self.admin_ids:
@@ -292,9 +433,131 @@ class TelegramBot:
         user = (update.get("message") or update.get("callback_query") or {}).get("from") or {}
         return int(user.get("id", 0)) in self.admin_ids
 
+    # ── Balance Command ──────────────────────────────────────────────
+
+    def do_balance(self, chat_id, message_id=None):
+        """Fetch and display current Yakka balance for the selected account."""
+        selected = next((a for a in self.accounts if a.key == self.selected_account), None)
+        if not selected:
+            text = "⚠️ <b>No account selected.</b>\nUse /add to configure an account."
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+            return
+
+        text = f"⏳ Fetching balance for <code>{esc(selected.key)}</code>..."
+        if message_id:
+            self.edit(chat_id, message_id, text)
+        else:
+            msg = self.send(chat_id, text)
+            message_id = msg.get("message_id") if msg else None
+
+        try:
+            client = ITZAQuizClient(selected.email, selected.password, style=self.style, quiet=True)
+            client.login()
+            balance = client.get_yakka()
+            user_info = client.get_user_info()
+
+            with self._active_client_lock:
+                self._active_client = client
+
+            lines = ["💰 <b>ITZA Balance</b>", ""]
+            lines.append(f"Account: <code>{esc(selected.key)}</code>")
+            if user_info:
+                name = user_info.get("name") or user_info.get("username") or ""
+                if name:
+                    lines.append(f"Name: <code>{esc(name)}</code>")
+            if balance is not None:
+                lines.append(f"Balance: <code>{balance:,}</code> Yakka 💎")
+            else:
+                lines.append("Balance: <code>unavailable</code>")
+            lines.append(f"\nEmail: <code>{esc(selected.email)}</code>")
+
+            text = "\n".join(lines)
+        except Exception as exc:
+            text = f"❌ <b>Balance check failed</b>\n<code>{esc(str(exc)[:200])}</code>"
+
+        if message_id:
+            self.edit(chat_id, message_id, text, markup=self.markup())
+        else:
+            self.send(chat_id, text, markup=self.markup())
+
+    # ── Check Command ────────────────────────────────────────────────
+
+    def do_check(self, chat_id, message_id=None):
+        """Verify account credentials, show balance and quiz count."""
+        selected = next((a for a in self.accounts if a.key == self.selected_account), None)
+        if not selected:
+            text = "⚠️ <b>No account selected.</b>\nUse /add to configure an account."
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+            return
+
+        text = f"🔍 Checking account <code>{esc(selected.key)}</code>...\n(login + quiz discovery, this may take 30-60s)"
+        if message_id:
+            self.edit(chat_id, message_id, text)
+        else:
+            msg = self.send(chat_id, text)
+            message_id = msg.get("message_id") if msg else None
+
+        def work():
+            try:
+                client = ITZAQuizClient(selected.email, selected.password,
+                                        style=self.style, quiet=True)
+                client.login()
+                balance = client.get_yakka()
+                user_info = client.get_user_info()
+                quizzes = client.get_quizzes()
+
+                with self._active_client_lock:
+                    self._active_client = client
+
+                lines = ["🔍 <b>Account Check — PASSED ✅</b>", ""]
+                lines.append(f"Account: <code>{esc(selected.key)}</code>")
+                lines.append(f"Email: <code>{esc(selected.email)}</code>")
+                if user_info:
+                    name = user_info.get("name") or user_info.get("username") or ""
+                    if name:
+                        lines.append(f"Name: <code>{esc(name)}</code>")
+                lines.append(f"\n✅ Login: <b>SUCCESS</b>")
+                if balance is not None:
+                    lines.append(f"💰 Balance: <code>{balance:,}</code> Yakka")
+                else:
+                    lines.append(f"💰 Balance: <code>unavailable</code>")
+                lines.append(f"📚 Available quizzes: <code>{len(quizzes):,}</code>")
+                lines.append(f"\n<i>Everything is working! Use ▶ Run queue to start.</i>")
+
+                text = "\n".join(lines)
+            except Exception as exc:
+                text = (f"🔍 <b>Account Check — FAILED ❌</b>\n\n"
+                        f"Account: <code>{esc(selected.key)}</code>\n"
+                        f"Error: <code>{esc(str(exc)[:300])}</code>\n\n"
+                        f"<i>Check your email/password and try again.</i>")
+
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+
+        # Run in background thread so it doesn't block the polling loop
+        threading.Thread(target=work, name="telegram-check", daemon=True).start()
+
+    # ── Queue Runner ─────────────────────────────────────────────────
+
     def run_queue(self, chat_id, message_id=None, *, all_accounts=False):
         with self.job_lock:
             if self.job and self.job.is_alive():
+                text = ("⚠️ <b>A job is already running!</b>\n\n"
+                        f"<code>{progress_bar(self.run_state.completed + self.run_state.failed, self.run_state.total)}</code>\n"
+                        f"Progress: {self.run_state.completed + self.run_state.failed}/{self.run_state.total}\n"
+                        f"Use 📊 Status to check progress.")
+                if message_id:
+                    self.edit(chat_id, message_id, text, markup=self.markup())
+                else:
+                    self.send(chat_id, text, markup=self.markup())
                 return False
 
             selected = next((a for a in self.accounts if a.key == self.selected_account), None)
@@ -309,53 +572,250 @@ class TelegramBot:
                           markup=no_acc_markup)
                 return False
 
+            # Initialize run state
+            self.run_state = RunState(
+                status="running",
+                started_at=time.time(),
+                account_key=", ".join(t.key for t in targets),
+            )
+
             def work():
-                try:
-                    def process(account):
+                total_ok = 0
+                total_fail = 0
+                total_quizzes = 0
+                account_errors = []
+                all_yakka_start = None
+                all_yakka_end = None
+
+                for acc_idx, account in enumerate(targets):
+                    try:
+                        # Login
+                        self.run_state.current_quiz = f"Logging in ({account.key})..."
                         client = ITZAQuizClient(account.email, account.password,
                                                 style=self.style, quiet=True)
                         client.login()
-                        quizzes = client.get_quizzes()
-                        ok, fail = client.run(quizzes, delay=0.2, workers=1,
-                                              style=self.style)
-                        return account.key, ok, fail
 
-                    completed = failed = 0
-                    account_errors = []
-                    # A bounded account pool handles 1,000+ configured records
-                    # without spawning one thread for each account.
-                    with ThreadPoolExecutor(max_workers=min(self.workers, len(targets)),
-                                            thread_name_prefix="itza-account") as pool:
-                        futures = {pool.submit(process, account): account for account in targets}
-                        for future in as_completed(futures):
-                            account = futures[future]
+                        with self._active_client_lock:
+                            self._active_client = client
+
+                        # Get starting balance
+                        yakka_before = client.get_yakka()
+                        if all_yakka_start is None and yakka_before is not None:
+                            all_yakka_start = yakka_before
+                        self.run_state.yakka_start = yakka_before
+
+                        # Discover quizzes
+                        self.run_state.current_quiz = f"Discovering quizzes ({account.key})..."
+                        quizzes = client.get_quizzes()
+
+                        if not quizzes:
+                            self.send(chat_id,
+                                      f"⚠️ No quizzes found for <code>{esc(account.key)}</code>.")
+                            continue
+
+                        self.run_state.total += len(quizzes)
+                        total_quizzes += len(quizzes)
+
+                        # Send initial progress message
+                        progress_msg = self.send(chat_id,
+                            f"▶ <b>Started: {esc(account.key)}</b>\n"
+                            f"Found <code>{len(quizzes):,}</code> quizzes\n"
+                            f"💰 Starting balance: <code>{yakka_before if yakka_before is not None else '?':,}</code> Yakka\n"
+                            f"<code>{progress_bar(0, len(quizzes))}</code>\n"
+                            f"Processing...")
+                        prog_mid = progress_msg.get("message_id") if progress_msg else None
+
+                        # Process quizzes one by one
+                        last_update_time = time.time()
+                        acc_ok = 0
+                        acc_fail = 0
+                        yakka_earned_this_acc = 0
+
+                        for i, lo in enumerate(quizzes, 1):
+                            quiz_name = (lo.get("lo_name") or lo.get("quiz_id") or "?")[:50]
+                            self.run_state.current_quiz = quiz_name
+
+                            # Get balance before quiz
+                            yakka_pre = None
+                            if i % 5 == 1 or i <= 3:  # Check every 5th quiz or first 3
+                                try:
+                                    yakka_pre = client.get_yakka()
+                                except Exception:
+                                    pass
+
+                            # Complete the quiz
                             try:
-                                _, ok, fail = future.result()
-                                completed += ok
-                                failed += fail
+                                success, detail, stats = client.complete_quiz(lo)
                             except Exception as exc:
-                                account_errors.append(f"{account.key}: {exc}")
-                    self.send(chat_id, f"✅ <b>Queue complete</b>\n\n"
-                              f"Accounts: <code>{len(targets):,}</code>\n"
-                              f"Completed: <code>{completed:,}</code>\n"
-                              f"Failed: <code>{failed:,}</code>\n"
-                              f"Account errors: <code>{len(account_errors):,}</code>",
-                              markup=self.markup())
-                except Exception as exc:
-                    LOG.exception("queue failed")
-                    self.send(chat_id, f"⚠️ <b>Queue failed</b>\n<code>{esc(exc)}</code>",
-                              markup=self.markup())
+                                success, detail, stats = False, f"error: {exc}", {}
+
+                            if success:
+                                acc_ok += 1
+                                self.run_state.completed += 1
+                            else:
+                                acc_fail += 1
+                                self.run_state.failed += 1
+                                if len(self.run_state.errors) < 20:
+                                    self.run_state.errors.append(f"{quiz_name}: {detail}")
+
+                            # Check balance after quiz for delta
+                            yakka_post = None
+                            if yakka_pre is not None:
+                                try:
+                                    yakka_post = client.get_yakka()
+                                    if yakka_post is not None and yakka_pre is not None:
+                                        delta = yakka_post - yakka_pre
+                                        if delta > 0:
+                                            yakka_earned_this_acc += delta
+                                            self.run_state.yakka_earned += delta
+                                except Exception:
+                                    pass
+
+                            self.run_state.yakka_current = yakka_post or yakka_pre
+
+                            # Update progress message (throttled: every 5 quizzes or 10 seconds)
+                            now = time.time()
+                            should_update = (
+                                i == len(quizzes) or  # Last quiz
+                                i % 5 == 0 or         # Every 5th
+                                i <= 3 or              # First 3
+                                (now - last_update_time) > 10  # Every 10 seconds
+                            )
+
+                            if should_update and prog_mid:
+                                last_update_time = now
+                                done = acc_ok + acc_fail
+                                elapsed = now - self.run_state.started_at
+                                result_icon = "✅" if success else "❌"
+
+                                update_lines = [
+                                    f"▶ <b>Running: {esc(account.key)}</b>",
+                                    f"<code>{progress_bar(done, len(quizzes))}</code>",
+                                    f"Progress: <code>{done}/{len(quizzes)}</code> "
+                                    f"(✅ {acc_ok} · ❌ {acc_fail})",
+                                    "",
+                                    f"{result_icon} <code>{esc(quiz_name)}</code>",
+                                ]
+                                q_count = stats.get("questions", 0)
+                                correct = stats.get("correct", 0)
+                                if q_count:
+                                    update_lines.append(
+                                        f"   Questions: {q_count} · Correct: {correct}")
+
+                                if yakka_earned_this_acc > 0:
+                                    update_lines.append(
+                                        f"\n💰 Points earned: <code>+{yakka_earned_this_acc:,}</code> Yakka")
+                                if self.run_state.yakka_current is not None:
+                                    update_lines.append(
+                                        f"💎 Current balance: <code>{self.run_state.yakka_current:,}</code>")
+
+                                update_lines.append(f"\n⏱ Elapsed: <code>{fmt_elapsed(elapsed)}</code>")
+
+                                try:
+                                    self.edit(chat_id, prog_mid,
+                                              "\n".join(update_lines))
+                                except Exception:
+                                    pass
+
+                            # Small delay between quizzes
+                            if i < len(quizzes):
+                                time.sleep(random.uniform(0.2, 1.0))
+
+                        total_ok += acc_ok
+                        total_fail += acc_fail
+
+                        # Get final balance for this account
+                        try:
+                            yakka_after = client.get_yakka()
+                            all_yakka_end = yakka_after
+                        except Exception:
+                            yakka_after = None
+
+                    except Exception as exc:
+                        account_errors.append(f"{account.key}: {exc}")
+                        LOG.exception("Account %s failed", account.key)
+
+                # ── Final Summary ────────────────────────────────────
+                self.run_state.status = "finished"
+                self.run_state.current_quiz = ""
+                elapsed = time.time() - self.run_state.started_at
+
+                # Store last run
+                self.last_run = LastRun(
+                    timestamp=time.time(),
+                    account_key=", ".join(t.key for t in targets),
+                    completed=total_ok,
+                    failed=total_fail,
+                    total=total_quizzes,
+                    yakka_start=all_yakka_start,
+                    yakka_end=all_yakka_end,
+                    yakka_earned=self.run_state.yakka_earned,
+                    elapsed=elapsed,
+                    scope="all accounts" if all_accounts else targets[0].key,
+                )
+
+                # Build summary message
+                summary = [
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                    "✅ <b>QUEUE COMPLETE</b>",
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                    "",
+                    f"📊 <b>Results</b>",
+                    f"Accounts: <code>{len(targets):,}</code>",
+                    f"Total quizzes: <code>{total_quizzes:,}</code>",
+                    f"Completed: <code>{total_ok:,}</code> ✅",
+                    f"Failed: <code>{total_fail:,}</code> ❌",
+                ]
+
+                if all_yakka_start is not None and all_yakka_end is not None:
+                    delta = all_yakka_end - all_yakka_start
+                    sign = "+" if delta >= 0 else ""
+                    summary.append("")
+                    summary.append(f"💰 <b>Points</b>")
+                    summary.append(f"Before: <code>{all_yakka_start:,}</code> Yakka")
+                    summary.append(f"After: <code>{all_yakka_end:,}</code> Yakka")
+                    summary.append(f"Earned: <code>{sign}{delta:,}</code> Yakka {'🎉' if delta > 0 else ''}")
+
+                if elapsed > 0:
+                    rate = total_quizzes / elapsed if elapsed else 0
+                    summary.append("")
+                    summary.append(f"⏱ <b>Performance</b>")
+                    summary.append(f"Time: <code>{fmt_elapsed(elapsed)}</code>")
+                    summary.append(f"Speed: <code>{rate:.2f}</code> quizzes/sec")
+
+                if account_errors:
+                    summary.append("")
+                    summary.append(f"⚠️ <b>Account Errors ({len(account_errors)})</b>")
+                    for err in account_errors[:5]:
+                        summary.append(f"  • <code>{esc(str(err)[:100])}</code>")
+
+                if self.run_state.errors:
+                    summary.append("")
+                    summary.append(f"❌ <b>Quiz Errors (showing {min(len(self.run_state.errors), 5)}/{len(self.run_state.errors)})</b>")
+                    for err in self.run_state.errors[:5]:
+                        summary.append(f"  • <code>{esc(str(err)[:80])}</code>")
+
+                summary.append("")
+                summary.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+                self.send(chat_id, "\n".join(summary), markup=self.markup())
 
             self.job = threading.Thread(target=work, name="telegram-queue", daemon=True)
             self.job.start()
+
         scope = f"all {len(targets):,} accounts" if all_accounts else esc(targets[0].key)
-        text = (f"▶ <b>Queue started</b>\nScope: <code>{scope}</code>\n"
-                "Workers are processing jobs in the background.")
+        text = (f"▶ <b>Queue started</b>\n"
+                f"Scope: <code>{scope}</code>\n"
+                f"Workers: <code>{self.workers}</code>\n\n"
+                f"<i>You'll see live progress updates below.\n"
+                f"Use 📊 Status to check anytime.</i>")
         if message_id:
             self.edit(chat_id, message_id, text, markup=self.markup())
         else:
             self.send(chat_id, text, markup=self.markup())
         return True
+
+    # ── Update Handler ───────────────────────────────────────────────
 
     def handle(self, update):
         if not self.allowed(update):
@@ -372,6 +832,10 @@ class TelegramBot:
                 self.run_queue(chat, mid, all_accounts=True)
             elif data == "status":
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
+            elif data == "balance":
+                self.do_balance(chat, mid)
+            elif data == "check":
+                self.do_check(chat, mid)
             elif data == "styles":
                 self.edit(chat, mid, "🎨 <b>Choose a dashboard style</b>",
                           markup=self.styles_markup())
@@ -394,10 +858,24 @@ class TelegramBot:
                     self.selected_account = key
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
             elif data == "help":
-                self.edit(chat, mid, "❔ <b>Help</b>\n"
-                          "• Use <b>▶ Run queue</b> to process the current account.\n"
-                          "• Use <b>➕ Add Account</b> or <code>/add email password</code> to save credentials.\n"
-                          "• Use <b>👤 Accounts</b> to select between configured accounts.",
+                self.edit(chat, mid,
+                          "❔ <b>Help — ITZA Bot Commands</b>\n\n"
+                          "<b>Queue Control:</b>\n"
+                          "• <b>▶ Run queue</b> — Process quizzes for current account\n"
+                          "• <b>▶ Run all</b> — Process all accounts\n\n"
+                          "<b>Information:</b>\n"
+                          "• <b>📊 Status</b> — Live dashboard with progress\n"
+                          "• <b>💰 Balance</b> — Check your Yakka points\n"
+                          "• <b>🔍 Check</b> — Verify login + show quiz count\n\n"
+                          "<b>Account Management:</b>\n"
+                          "• <b>➕ Add Account</b> — Save new credentials\n"
+                          "• <b>👤 Accounts</b> — Select/manage accounts\n"
+                          "• <code>/add email password</code> — Quick add\n"
+                          "• <code>/del account_key</code> — Delete account\n\n"
+                          "<b>Other:</b>\n"
+                          "• <code>/balance</code> — Check Yakka balance\n"
+                          "• <code>/check</code> — Verify everything works\n"
+                          "• <code>/style</code> — Change theme",
                           markup=self.markup())
             elif data == "home":
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
@@ -439,6 +917,10 @@ class TelegramBot:
             self.run_queue(chat)
         elif command == "/runall":
             self.run_queue(chat, all_accounts=True)
+        elif command == "/balance":
+            self.do_balance(chat)
+        elif command == "/check":
+            self.do_check(chat)
         elif command == "/style":
             self.send(chat, "🎨 <b>Choose a dashboard style</b>", markup=self.styles_markup())
         elif command == "/accounts":
@@ -477,6 +959,8 @@ class TelegramBot:
             {"command": "start", "description": "Open dashboard"},
             {"command": "run", "description": "Run quiz queue"},
             {"command": "runall", "description": "Run all accounts"},
+            {"command": "balance", "description": "Check Yakka balance"},
+            {"command": "check", "description": "Verify login & quiz count"},
             {"command": "add", "description": "Add ITZA email & password"},
             {"command": "accounts", "description": "Manage saved accounts"},
             {"command": "status", "description": "Show worker status"},
@@ -485,14 +969,18 @@ class TelegramBot:
         self.api.call("setChatMenuButton", menu_button={"type": "commands"})
         self.api.call("deleteWebhook", drop_pending_updates=False)
         while True:
-            updates = self.api.call("getUpdates", offset=self.offset,
-                                    timeout=25, allowed_updates=["message", "callback_query"])
-            for update in updates or []:
-                self.offset = update["update_id"] + 1
-                try:
-                    self.handle(update)
-                except Exception:
-                    LOG.exception("update handling failed")
+            try:
+                updates = self.api.call("getUpdates", offset=self.offset,
+                                        timeout=25, allowed_updates=["message", "callback_query"])
+                for update in updates or []:
+                    self.offset = update["update_id"] + 1
+                    try:
+                        self.handle(update)
+                    except Exception:
+                        LOG.exception("update handling failed")
+            except Exception:
+                LOG.exception("polling error, retrying in 5s...")
+                time.sleep(5)
 
 
 def load_dotenv():
