@@ -120,20 +120,22 @@ def load_accounts(path="", email="", password=""):
     """Load account records without printing or exposing passwords.
 
     The JSON format is ``[{"key":"main", "email":"...", "password":"..."}]``.
-    An environment-variable account is used when no file is configured.
+    An environment-variable account is used when no file is configured or missing.
     """
-    if path:
-        with open(path, encoding="utf-8") as fh:
-            records = json.load(fh)
-        if not isinstance(records, list):
-            raise ValueError("accounts file must contain a JSON list")
-        result = []
-        for i, item in enumerate(records, 1):
-            if not isinstance(item, dict) or not item.get("email") or not item.get("password"):
-                raise ValueError(f"invalid account record at index {i - 1}")
-            result.append(AccountSpec(str(item.get("key") or i),
-                                      str(item["email"]), str(item["password"])))
-        return result
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                records = json.load(fh)
+            if isinstance(records, list):
+                result = []
+                for i, item in enumerate(records, 1):
+                    if isinstance(item, dict) and item.get("email") and item.get("password"):
+                        result.append(AccountSpec(str(item.get("key") or i),
+                                                  str(item["email"]), str(item["password"])))
+                if result:
+                    return result
+        except Exception as exc:
+            LOG.warning("Failed to load accounts from %s: %s", path, exc)
     return [AccountSpec("default", email, password)] if email and password else []
 
 
