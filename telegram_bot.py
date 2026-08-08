@@ -137,6 +137,15 @@ def load_accounts(path="", email="", password=""):
     return [AccountSpec("default", email, password)] if email and password else []
 
 
+def save_accounts(path, accounts):
+    """Save account list to JSON file."""
+    if not path:
+        path = "accounts.json"
+    data = [{"key": a.key, "email": a.email, "password": a.password} for a in accounts]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+
+
 def esc(value) -> str:
     """Escape arbitrary account/quiz text for Telegram HTML parse mode."""
     return html.escape(str(value or ""), quote=False)
@@ -168,8 +177,6 @@ class TelegramAPI:
                                         timeout=self.timeout)
         response.raise_for_status()
         data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(data.get("description", f"Telegram {method} failed"))
         return data.get("result")
 
 
@@ -180,7 +187,8 @@ class TelegramBot:
             raise ValueError(f"unknown style: {style}")
         self.api = TelegramAPI(token)
         self.style = style
-        self.accounts = list(accounts or load_accounts(email=email, password=password))
+        self.accounts_file = os.environ.get("ITZA_ACCOUNTS_FILE", "").strip() or "accounts.json"
+        self.accounts = list(accounts or load_accounts(self.accounts_file, email=email, password=password))
         self.selected_account = self.accounts[0].key if self.accounts else ""
         self.workers = max(1, min(int(workers), 32))
         self.admin_ids = {int(x) for x in admin_ids if str(x).strip().lstrip("-").isdigit()}
@@ -188,19 +196,46 @@ class TelegramBot:
         self.started = time.time()
         self.job_lock = threading.Lock()
         self.job = None
+        self.pending_states = {}
 
     @property
     def theme(self):
         return BOT_STYLES[self.style]
+
+    def add_account(self, email: str, password: str, key: str | None = None) -> AccountSpec:
+        """Add or update an account specification and save to disk."""
+        email = email.strip()
+        password = password.strip()
+        key = (key or email).strip()
+        existing = next((a for a in self.accounts if a.key == key or a.email == email), None)
+        if existing:
+            self.accounts.remove(existing)
+        spec = AccountSpec(key=key, email=email, password=password)
+        self.accounts.append(spec)
+        self.selected_account = spec.key
+        save_accounts(self.accounts_file, self.accounts)
+        return spec
+
+    def delete_account(self, key: str) -> bool:
+        """Delete an account specification and save to disk."""
+        target = next((a for a in self.accounts if a.key == key), None)
+        if target:
+            self.accounts.remove(target)
+            if self.selected_account == key:
+                self.selected_account = self.accounts[0].key if self.accounts else ""
+            save_accounts(self.accounts_file, self.accounts)
+            return True
+        return False
 
     def markup(self):
         return {"inline_keyboard": [
             [{"text": "▶ Run queue", "callback_data": "run"},
              {"text": "▶ Run all", "callback_data": "runall"}],
             [{"text": "📊 Status", "callback_data": "status"},
-             {"text": "👤 Account", "callback_data": "accounts"}],
-            [{"text": "🎨 Style", "callback_data": "styles"},
-             {"text": "❔ Help", "callback_data": "help"}],
+             {"text": "👤 Accounts", "callback_data": "accounts"}],
+            [{"text": "➕ Add Account", "callback_data": "add_account"},
+             {"text": "🎨 Style", "callback_data": "styles"}],
+            [{"text": "❔ Help", "callback_data": "help"}],
         ]}
 
     def styles_markup(self):
@@ -211,7 +246,7 @@ class TelegramBot:
         ], [{"text": "‹ Back", "callback_data": "home"}]]}
 
     def accounts_markup(self):
-        rows = []
+        rows = [[{"text": "➕ Add New Account", "callback_data": "add_account"}]]
         for account in self.accounts[:100]:
             rows.append([{"text": ("✅ " if account.key == self.selected_account else "") + account.key,
                           "callback_data": f"account:{account.key}"}])
@@ -263,8 +298,13 @@ class TelegramBot:
             selected = next((a for a in self.accounts if a.key == self.selected_account), None)
             targets = self.accounts if all_accounts else ([selected] if selected else [])
             if not targets:
-                self.send(chat_id, "⚠️ <b>No account configured.</b> Set ITZA_EMAIL/ITZA_PASSWORD "
-                          "or provide ITZA_ACCOUNTS_FILE.", markup=self.markup())
+                no_acc_markup = {"inline_keyboard": [
+                    [{"text": "➕ Add Account", "callback_data": "add_account"}],
+                    [{"text": "‹ Back", "callback_data": "home"}]
+                ]}
+                self.send(chat_id, "⚠️ <b>No account configured.</b>\n\n"
+                          "Use <b>/add</b> or click below to enter your ITZA email & password.",
+                          markup=no_acc_markup)
                 return False
 
             def work():
@@ -336,6 +376,13 @@ class TelegramBot:
             elif data == "accounts":
                 self.edit(chat, mid, "👤 <b>Choose an account</b>",
                           markup=self.accounts_markup())
+            elif data == "add_account":
+                self.pending_states[chat] = "add_account"
+                self.edit(chat, mid, "➕ <b>Add ITZA Account</b>\n\n"
+                          "Please send your email and password separated by a space:\n"
+                          "<code>email@example.com mypassword</code>\n\n"
+                          "Or use command:\n"
+                          "<code>/add email@example.com mypassword</code>")
             elif data.startswith("style:"):
                 self.style = data.split(":", 1)[1]
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
@@ -345,15 +392,43 @@ class TelegramBot:
                     self.selected_account = key
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
             elif data == "help":
-                self.edit(chat, mid, "❔ <b>Help</b>\nUse Run queue to start processing, "
-                          "Status to inspect the worker pool, and Style to change formatting.",
+                self.edit(chat, mid, "❔ <b>Help</b>\n"
+                          "• Use <b>▶ Run queue</b> to process the current account.\n"
+                          "• Use <b>➕ Add Account</b> or <code>/add email password</code> to save credentials.\n"
+                          "• Use <b>👤 Accounts</b> to select between configured accounts.",
                           markup=self.markup())
             elif data == "home":
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
             return
+
         message = update.get("message") or {}
         chat = message.get("chat", {}).get("id")
-        command = (message.get("text") or "").split()[0].split("@", 1)[0].lower()
+        text = (message.get("text") or "").strip()
+        if not chat or not text:
+            return
+
+        # Check if chat is in pending state (e.g. waiting for email password input)
+        if chat in self.pending_states and not text.startswith("/"):
+            state = self.pending_states.pop(chat, None)
+            if state == "add_account":
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2 and "@" in parts[0]:
+                    email, pwd = parts[0], parts[1]
+                    acc = self.add_account(email, pwd)
+                    self.send(chat, f"✅ <b>Account saved successfully!</b>\n\n"
+                              f"Email: <code>{esc(acc.email)}</code>\n"
+                              f"Total Accounts: <code>{len(self.accounts)}</code>",
+                              markup=self.markup())
+                    return
+                else:
+                    self.send(chat, "⚠️ <b>Invalid format.</b> Send email and password separated by space:\n"
+                              "<code>email@example.com mypassword</code>",
+                              markup=self.markup())
+                    return
+
+        command_parts = text.split(maxsplit=2)
+        command = command_parts[0].split("@", 1)[0].lower()
+
         if command in ("/start", "/help"):
             self.send(chat, self.dashboard(), markup=self.markup())
         elif command == "/status":
@@ -366,15 +441,44 @@ class TelegramBot:
             self.send(chat, "🎨 <b>Choose a dashboard style</b>", markup=self.styles_markup())
         elif command == "/accounts":
             self.send(chat, "👤 <b>Choose an account</b>", markup=self.accounts_markup())
+        elif command in ("/add", "/addaccount"):
+            if len(command_parts) >= 3:
+                email = command_parts[1]
+                pwd = command_parts[2]
+                acc = self.add_account(email, pwd)
+                self.send(chat, f"✅ <b>Account saved successfully!</b>\n\n"
+                          f"Email: <code>{esc(acc.email)}</code>\n"
+                          f"Total Accounts: <code>{len(self.accounts)}</code>",
+                          markup=self.markup())
+            else:
+                self.pending_states[chat] = "add_account"
+                self.send(chat, "➕ <b>Add ITZA Account</b>\n\n"
+                          "Please reply to this message with your email and password separated by a space:\n"
+                          "<code>your_email@example.com your_password</code>\n\n"
+                          "Or send:\n<code>/add email@example.com password</code>",
+                          markup=self.markup())
+        elif command in ("/del", "/delaccount", "/deleteaccount"):
+            if len(command_parts) >= 2:
+                key = command_parts[1]
+                if self.delete_account(key):
+                    self.send(chat, f"🗑️ <b>Account <code>{esc(key)}</code> deleted.</b>",
+                              markup=self.markup())
+                else:
+                    self.send(chat, f"⚠️ <b>Account <code>{esc(key)}</code> not found.</b>",
+                              markup=self.markup())
+            else:
+                self.send(chat, "⚠️ <b>Usage:</b> <code>/del account_key</code>",
+                          markup=self.markup())
 
     def poll(self):
         self.api.call("setMyCommands", commands=[
-            {"command": "start", "description": "Open the dashboard"},
-            {"command": "run", "description": "Run the quiz queue"},
-            {"command": "runall", "description": "Run all configured accounts"},
+            {"command": "start", "description": "Open dashboard"},
+            {"command": "run", "description": "Run quiz queue"},
+            {"command": "runall", "description": "Run all accounts"},
+            {"command": "add", "description": "Add ITZA email & password"},
+            {"command": "accounts", "description": "Manage saved accounts"},
             {"command": "status", "description": "Show worker status"},
             {"command": "style", "description": "Choose UI style"},
-            {"command": "accounts", "description": "Choose an account"},
         ])
         self.api.call("setChatMenuButton", menu_button={"type": "commands"})
         self.api.call("deleteWebhook", drop_pending_updates=False)
