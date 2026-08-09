@@ -31,6 +31,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from itza import ITZAQuizClient, THEMES
+from itza_loop import ITZAQuizClient as LoopClient
 
 
 LOG = logging.getLogger("itza.telegram")
@@ -192,6 +193,21 @@ class LastRun:
     scope: str = ""
 
 
+@dataclass
+class LoopState:
+    """Tracks the state of the continuous mining loop."""
+    running: bool = False
+    loop_count: int = 0
+    total_earned: int = 0
+    started_at: float = 0.0
+    current_loop_ok: int = 0
+    current_loop_fail: int = 0
+    current_quiz: str = ""
+    total_quizzes: int = 0
+    account_key: str = ""
+    last_balance: int | None = None
+
+
 # ── Telegram API ─────────────────────────────────────────────────────
 
 class TelegramAPI:
@@ -270,6 +286,11 @@ class TelegramBot:
         self._active_client = None  # ITZAQuizClient used by current/last run
         self._active_client_lock = threading.Lock()
 
+        # Continuous mining loop
+        self.loop_state = LoopState()
+        self.loop_thread = None  # Thread for the continuous loop
+        self._loop_stop_event = threading.Event()  # Signal to stop the loop
+
     @property
     def theme(self):
         return BOT_STYLES[self.style]
@@ -303,6 +324,8 @@ class TelegramBot:
 
     def markup(self):
         return {"inline_keyboard": [
+            [{"text": "🔄 Start Loop", "callback_data": "startloop"},
+             {"text": "⏹ Stop Loop", "callback_data": "stoploop"}],
             [{"text": "▶ Run queue", "callback_data": "run"},
              {"text": "▶ Run all", "callback_data": "runall"}],
             [{"text": "📊 Status", "callback_data": "status"},
@@ -347,6 +370,10 @@ class TelegramBot:
         else:
             state = "⚪ <b>idle</b>"
 
+        # Check loop state
+        if self.loop_state.running:
+            state = "🔄 <b>LOOP MINING</b>"
+
         lines = [
             f"{t.icon} <b>ITZA Queue Runner</b>",
             "",
@@ -376,6 +403,28 @@ class TelegramBot:
             elapsed = time.time() - rs.started_at if rs.started_at else 0
             if elapsed > 0:
                 lines.append(f"Elapsed: <code>{fmt_elapsed(elapsed)}</code>")
+
+        # Show loop progress if loop is running
+        if self.loop_state.running:
+            ls = self.loop_state
+            lines.append("")
+            lines.append(f"<b>🔄 Mining Loop Active</b>")
+            lines.append(f"Account: <code>{esc(ls.account_key)}</code>")
+            lines.append(f"Loop: <code>#{ls.loop_count}</code>")
+            if ls.total_quizzes > 0:
+                done = ls.current_loop_ok + ls.current_loop_fail
+                lines.append(f"<code>{progress_bar(done, ls.total_quizzes)}</code>")
+                lines.append(f"Progress: <code>{done}/{ls.total_quizzes}</code> "
+                             f"(✅ {ls.current_loop_ok} · ❌ {ls.current_loop_fail})")
+            if ls.current_quiz:
+                lines.append(f"Current: <code>{esc(ls.current_quiz[:50])}</code>")
+            if ls.last_balance is not None:
+                lines.append(f"💰 Balance: <code>{ls.last_balance:,}</code>")
+            if ls.total_earned > 0:
+                lines.append(f"📈 Total earned: <code>+{ls.total_earned:,}</code> Yakka")
+            elapsed = time.time() - ls.started_at if ls.started_at else 0
+            if elapsed > 0:
+                lines.append(f"⏱ Uptime: <code>{fmt_elapsed(elapsed)}</code>")
 
         # Show last run info
         if self.last_run and not (job and job.is_alive()):
@@ -548,6 +597,14 @@ class TelegramBot:
     # ── Queue Runner ─────────────────────────────────────────────────
 
     def run_queue(self, chat_id, message_id=None, *, all_accounts=False):
+        if self.loop_state.running:
+            text = "⚠️ <b>A mining loop is running!</b>\nStop it first with ⏹ Stop Loop before running a one-time queue."
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+            return False
+
         with self.job_lock:
             if self.job and self.job.is_alive():
                 text = ("⚠️ <b>A job is already running!</b>\n\n"
@@ -815,6 +872,229 @@ class TelegramBot:
             self.send(chat_id, text, markup=self.markup())
         return True
 
+    # ── Continuous Mining Loop ────────────────────────────────────────
+
+    def start_loop(self, chat_id, message_id=None):
+        """Start the continuous mining loop."""
+        if self.loop_state.running:
+            text = "⚠️ <b>Mining loop is already running!</b>\nUse ⏹ Stop Loop or /stoploop to stop it first."
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+            return
+
+        with self.job_lock:
+            if self.job and self.job.is_alive():
+                text = "⚠️ <b>A one-time queue job is running!</b>\nWait for it to finish or restart the bot first."
+                if message_id:
+                    self.edit(chat_id, message_id, text, markup=self.markup())
+                else:
+                    self.send(chat_id, text, markup=self.markup())
+                return
+
+        selected = next((a for a in self.accounts if a.key == self.selected_account), None)
+        if not selected:
+            text = "⚠️ <b>No account selected.</b>\nUse /add to configure an account."
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+            return
+
+        self._loop_stop_event.clear()
+        self.loop_state = LoopState(
+            running=True,
+            started_at=time.time(),
+            account_key=selected.key,
+        )
+
+        self.loop_thread = threading.Thread(
+            target=self._loop_worker, args=(chat_id, selected),
+            name="telegram-loop", daemon=True)
+        self.loop_thread.start()
+
+        text = (f"🔄 <b>Mining loop starting...</b>\n"
+                f"Account: <code>{esc(selected.key)}</code>\n\n"
+                f"<i>Use ⏹ Stop Loop or /stoploop to stop.</i>")
+        if message_id:
+            self.edit(chat_id, message_id, text, markup=self.markup())
+        else:
+            self.send(chat_id, text, markup=self.markup())
+
+    def _loop_worker(self, chat_id, account):
+        """Background worker that continuously mines quizzes until stopped."""
+        try:
+            # Login using itza_loop's client
+            client = LoopClient(account.email, account.password)
+            client.login()
+
+            yakka_start = client.get_yakka()
+            self.loop_state.last_balance = yakka_start
+
+            # Send initial message
+            self.send(chat_id, f"🔄 <b>Mining Loop Active</b>\n\n"
+                      f"Account: <code>{esc(account.key)}</code>\n"
+                      f"💰 Starting balance: <code>{yakka_start if yakka_start is not None else '?'}</code> Yakka\n\n"
+                      f"<i>Mining will continue until you stop it.\nUse ⏹ Stop Loop or /stoploop</i>")
+
+            loop_num = 0
+            while not self._loop_stop_event.is_set():
+                loop_num += 1
+                self.loop_state.loop_count = loop_num
+                self.loop_state.current_loop_ok = 0
+                self.loop_state.current_loop_fail = 0
+
+                # Refresh token if needed
+                try:
+                    client._ensure_token()
+                except Exception:
+                    # Re-login if token refresh fails
+                    try:
+                        client.login()
+                    except Exception as e:
+                        self.send(chat_id, f"❌ <b>Loop Error: Re-login failed</b>\n<code>{esc(str(e)[:200])}</code>")
+                        break
+
+                # Discover quizzes
+                self.loop_state.current_quiz = "Discovering quizzes..."
+                try:
+                    quizzes = client.get_quizzes()
+                except Exception as e:
+                    self.send(chat_id, f"⚠️ Quiz discovery failed, retrying in 30s...\n<code>{esc(str(e)[:100])}</code>")
+                    if self._loop_stop_event.wait(30):
+                        break
+                    continue
+
+                if not quizzes:
+                    self.send(chat_id, "⚠️ No quizzes found. Retrying in 60s...")
+                    if self._loop_stop_event.wait(60):
+                        break
+                    continue
+
+                self.loop_state.total_quizzes = len(quizzes)
+
+                # Send loop start notification
+                before_balance = client.get_yakka()
+                self.loop_state.last_balance = before_balance
+
+                self.send(chat_id, f"🔄 <b>Loop #{loop_num}</b> starting\n"
+                          f"📚 Quizzes: <code>{len(quizzes)}</code>\n"
+                          f"💰 Balance: <code>{before_balance if before_balance is not None else '?'}</code>")
+
+                # Process all quizzes in this loop pass
+                loop_ok = 0
+                loop_fail = 0
+                loop_earned = 0
+
+                for i, lo in enumerate(quizzes):
+                    if self._loop_stop_event.is_set():
+                        break
+
+                    quiz_name = (lo.get("lo_name") or lo.get("quiz_id") or "?")[:50]
+                    self.loop_state.current_quiz = quiz_name
+
+                    # Get pre-quiz balance every 5th quiz
+                    yakka_pre = None
+                    if i % 5 == 0:
+                        try:
+                            yakka_pre = client.get_yakka()
+                        except Exception:
+                            pass
+
+                    try:
+                        success, detail, stats = client.complete_quiz(lo)
+                    except Exception as e:
+                        success, detail, stats = False, f"error: {e}", {}
+
+                    if success:
+                        loop_ok += 1
+                    else:
+                        loop_fail += 1
+
+                    self.loop_state.current_loop_ok = loop_ok
+                    self.loop_state.current_loop_fail = loop_fail
+
+                    # Check balance delta
+                    if yakka_pre is not None:
+                        try:
+                            yakka_post = client.get_yakka()
+                            if yakka_post is not None:
+                                delta = yakka_post - yakka_pre
+                                if delta > 0:
+                                    loop_earned += delta
+                                self.loop_state.last_balance = yakka_post
+                        except Exception:
+                            pass
+
+                    # Small delay between quizzes
+                    if i < len(quizzes) - 1:
+                        delay = 2.0 + random.uniform(0, 1.5)
+                        if self._loop_stop_event.wait(delay):
+                            break
+
+                self.loop_state.total_earned += loop_earned
+
+                # Loop pass complete summary
+                after_balance = client.get_yakka()
+                self.loop_state.last_balance = after_balance
+
+                elapsed = time.time() - self.loop_state.started_at
+                self.send(chat_id,
+                    f"✅ <b>Loop #{loop_num} Complete</b>\n\n"
+                    f"Results: ✅ {loop_ok} · ❌ {loop_fail}\n"
+                    f"💰 Balance: <code>{after_balance if after_balance is not None else '?'}</code>\n"
+                    f"📈 This loop: <code>+{loop_earned}</code> · Total: <code>+{self.loop_state.total_earned}</code>\n"
+                    f"⏱ Total uptime: <code>{fmt_elapsed(elapsed)}</code>")
+
+                if self._loop_stop_event.is_set():
+                    break
+
+                # Cooldown before next loop
+                cooldown = 5
+                self.loop_state.current_quiz = f"Cooldown {cooldown}s before loop #{loop_num + 1}..."
+                if self._loop_stop_event.wait(cooldown):
+                    break
+
+        except Exception as e:
+            self.send(chat_id, f"❌ <b>Loop crashed</b>\n<code>{esc(str(e)[:300])}</code>\n\n<i>Use ▶ Start Loop to restart.</i>",
+                      markup=self.markup())
+        finally:
+            final_balance = None
+            try:
+                final_balance = client.get_yakka()
+            except Exception:
+                pass
+
+            self.loop_state.running = False
+            self.loop_state.current_quiz = ""
+            elapsed = time.time() - self.loop_state.started_at
+
+            self.send(chat_id,
+                f"⏹ <b>Mining Loop Stopped</b>\n\n"
+                f"🔄 Loops completed: <code>{self.loop_state.loop_count}</code>\n"
+                f"📈 Total earned: <code>+{self.loop_state.total_earned}</code> Yakka\n"
+                f"💰 Final balance: <code>{final_balance if final_balance is not None else '?'}</code>\n"
+                f"⏱ Total runtime: <code>{fmt_elapsed(elapsed)}</code>",
+                markup=self.markup())
+
+    def stop_loop(self, chat_id, message_id=None):
+        """Stop the continuous mining loop."""
+        if not self.loop_state.running:
+            text = "ℹ️ <b>No mining loop is running.</b>\nUse 🔄 Start Loop or /startloop to begin."
+            if message_id:
+                self.edit(chat_id, message_id, text, markup=self.markup())
+            else:
+                self.send(chat_id, text, markup=self.markup())
+            return
+
+        self._loop_stop_event.set()
+        text = "⏳ <b>Stopping mining loop...</b>\n<i>Finishing current quiz, please wait.</i>"
+        if message_id:
+            self.edit(chat_id, message_id, text, markup=self.markup())
+        else:
+            self.send(chat_id, text, markup=self.markup())
+
     # ── Update Handler ───────────────────────────────────────────────
 
     def handle(self, update):
@@ -830,6 +1110,10 @@ class TelegramBot:
                 self.run_queue(chat, mid)
             elif data == "runall":
                 self.run_queue(chat, mid, all_accounts=True)
+            elif data == "startloop":
+                self.start_loop(chat, mid)
+            elif data == "stoploop":
+                self.stop_loop(chat, mid)
             elif data == "status":
                 self.edit(chat, mid, self.dashboard(), markup=self.markup())
             elif data == "balance":
@@ -860,6 +1144,11 @@ class TelegramBot:
             elif data == "help":
                 self.edit(chat, mid,
                           "❔ <b>Help — ITZA Bot Commands</b>\n\n"
+                          "<b>Mining Loop:</b>\n"
+                          "• <b>🔄 Start Loop</b> — Start continuous mining\n"
+                          "• <b>⏹ Stop Loop</b> — Stop the mining loop\n"
+                          "• <code>/startloop</code> — Start loop via command\n"
+                          "• <code>/stoploop</code> — Stop loop via command\n\n"
                           "<b>Queue Control:</b>\n"
                           "• <b>▶ Run queue</b> — Process quizzes for current account\n"
                           "• <b>▶ Run all</b> — Process all accounts\n\n"
@@ -917,6 +1206,10 @@ class TelegramBot:
             self.run_queue(chat)
         elif command == "/runall":
             self.run_queue(chat, all_accounts=True)
+        elif command == "/startloop":
+            self.start_loop(chat)
+        elif command == "/stoploop":
+            self.stop_loop(chat)
         elif command == "/balance":
             self.do_balance(chat)
         elif command == "/check":
@@ -959,6 +1252,8 @@ class TelegramBot:
             {"command": "start", "description": "Open dashboard"},
             {"command": "run", "description": "Run quiz queue"},
             {"command": "runall", "description": "Run all accounts"},
+            {"command": "startloop", "description": "Start continuous mining loop"},
+            {"command": "stoploop", "description": "Stop the mining loop"},
             {"command": "balance", "description": "Check Yakka balance"},
             {"command": "check", "description": "Verify login & quiz count"},
             {"command": "add", "description": "Add ITZA email & password"},
